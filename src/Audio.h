@@ -97,6 +97,36 @@ protected:
     bool         m_f_start       = true;
 };
 //----------------------------------------------------------------------------------------------------------------------
+class ADCBuffer {
+    public:
+        ADCBuffer(int32_t bufferSizeInBytes);
+        ~ADCBuffer();
+
+        int32_t getBufferSizeInBytes();
+        int16_t *getCapturedAudioBuffer();
+        void setFilled(bool filled);
+        bool isFilled();
+        bool addSample(int16_t sample);
+        void reset();
+
+    private:
+        // double buffer so we can be capturing samples while sending data
+        int16_t *m_audioBuffer1;
+        int16_t *m_audioBuffer2;
+        // current position in the audio buffer
+        int32_t m_audioBufferPos = 0;
+        // current audio buffer
+        int16_t *m_currentAudioBuffer;
+        // buffer containing samples that have been captured already
+        int16_t *m_capturedAudioBuffer;
+        // size of the audio buffers in bytes
+        int32_t m_bufferSizeInBytes;
+        // size of the audio buffer in samples
+        int32_t m_bufferSizeInSamples;
+
+        bool m_filled = false;
+};
+//----------------------------------------------------------------------------------------------------------------------
 
 class Audio : private AudioBuffer{
 
@@ -109,6 +139,7 @@ public:
     bool connecttoSD(String sdfile);
     bool connecttohost(String host);
     bool connecttospeech(String speech, String lang);
+    bool connecttoADC(adc_unit_t adcUnit, adc1_channel_t adcChannel);
     void loop();
     uint32_t getFileSize();
     uint32_t getFilePos();
@@ -156,10 +187,19 @@ public:
     uint32_t inBufferFilled(); // returns the number of stored bytes in the inputbuffer
     uint32_t inBufferFree();   // returns the number of free bytes in the inputbuffer
 
+    // i2s ADC
+    static void i2sReaderTask(void *param);
+    QueueHandle_t getQueueHandle();
+    bool isADCRunning();
+    bool isADCTaskRunning();
+    void setADCTaskRunning(bool running);
+    void processI2SData(uint8_t *i2sData, size_t bytesRead);
+
 private:
     void reset(); // free buffers and set defaults
     void processLocalFile();
     void processWebStream();
+    void processADC();
     int  sendBytes(uint8_t *data, size_t len);
     void compute_audioCurrentTime(int bd);
     void printDecodeError(int r);
@@ -196,6 +236,11 @@ private:
     WiFiClient        client;       // @suppress("Abstract class cannot be instantiated")
     WiFiClientSecure  clientsecure; // @suppress("Abstract class cannot be instantiated")
     i2s_config_t      m_i2s_config; // stores values for I2S driver
+    i2s_config_t      m_i2s_adc_config; // i2s adc reader config
+    QueueHandle_t   m_i2sQueue;     // i2s reader queue for ADC
+    bool            m_adctask_running=false; // is ADC reader task running
+    uint32_t        m_adc_sampleRate=16000; // default sample rate for ADC
+    ADCBuffer       m_adc_buf;      // ADC buffer
     char            chbuf[256];
     char            path[256];
     int             m_id3Size=0;                    // length id3 tag
@@ -215,7 +260,7 @@ private:
     uint8_t         m_vol=64;                       // volume
     uint8_t         m_bitsPerSample=16;             // bitsPerSample
     uint8_t         m_channels=2;
-    uint8_t         m_i2s_num= I2S_NUM_0;           // I2S_NUM_0 or I2S_NUM_1
+    uint8_t         m_i2s_num=I2S_NUM_1;           // I2S_NUM_0 or I2S_NUM_1
     int16_t         m_buffValid;
     int16_t         m_lastFrameEnd;
     int16_t         m_outBuff[2048*2];              //[1152 * 2];          // Interleaved L/R
@@ -247,6 +292,7 @@ private:
     bool            m_f_exthdr = false;             // ID3 extended header
     bool            m_f_localfile = false ;         // Play from local mp3-file
     bool            m_f_webstream = false ;         // Play from URL
+    bool            m_f_adc_running = false ;       // Play from ADC
     bool            m_f_ssl=false;
     bool            m_f_running=false;
     bool            m_f_firststream_ready=false;    // Set after connecttohost and first streamdata are available

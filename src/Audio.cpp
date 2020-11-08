@@ -17,6 +17,94 @@
 #include "mp3_decoder/mp3_decoder.h"
 #include "aac_decoder/aac_decoder.h"
 
+
+//---------------------------------------------------------------------------------------------------------------------
+void Audio::i2sReaderTask(void *param)
+{
+    Audio *audio = (Audio *)param;
+    audio->setADCTaskRunning(true);
+    while (audio->isADCRunning())
+    {
+        // wait for some data to arrive on the queue
+        i2s_event_t evt;
+        if (xQueueReceive(audio->getQueueHandle(), &evt, portMAX_DELAY) == pdPASS)
+        {
+            if (evt.type == I2S_EVENT_RX_DONE)
+            {
+                size_t bytesRead = 0;
+                do
+                {
+                    // read data from the I2S peripheral
+                    uint8_t i2sData[1024];
+                    // read from i2s
+                    i2s_read(I2S_NUM_0, i2sData, 1024, &bytesRead, 10);
+                    // process the raw data
+                    audio->processI2SData(i2sData, bytesRead);
+                } while (bytesRead > 0);
+            }
+        }
+    }
+    audio->setADCTaskRunning(false);
+    Serial.println("ADC task shutdown");
+    // xQueueReset(audio->getQueueHandle());
+    vTaskDelete(NULL);
+}
+//---------------------------------------------------------------------------------------------------------------------
+ADCBuffer::ADCBuffer(int32_t bufferSizeInBytes) {
+    m_bufferSizeInSamples = bufferSizeInBytes / sizeof(int16_t);
+    m_bufferSizeInBytes = bufferSizeInBytes;
+    m_audioBuffer1 = (int16_t *)malloc(bufferSizeInBytes);
+    m_audioBuffer2 = (int16_t *)malloc(bufferSizeInBytes);
+
+    m_currentAudioBuffer = m_audioBuffer1;
+    m_capturedAudioBuffer = m_audioBuffer2;
+}
+//---------------------------------------------------------------------------------------------------------------------
+ADCBuffer::~ADCBuffer() {
+    free(m_audioBuffer1);
+    free(m_audioBuffer2);
+}
+//---------------------------------------------------------------------------------------------------------------------
+int32_t ADCBuffer::getBufferSizeInBytes()
+{
+    return m_bufferSizeInBytes;
+}
+//---------------------------------------------------------------------------------------------------------------------
+int16_t* ADCBuffer::getCapturedAudioBuffer()
+{
+    return m_capturedAudioBuffer;
+}
+//---------------------------------------------------------------------------------------------------------------------
+void ADCBuffer::setFilled(bool filled){
+    m_filled = filled;
+}
+//---------------------------------------------------------------------------------------------------------------------
+bool ADCBuffer::isFilled(){
+    return m_filled;
+}
+//---------------------------------------------------------------------------------------------------------------------
+bool ADCBuffer::addSample(int16_t sample){
+    m_currentAudioBuffer[m_audioBufferPos] = sample;
+    m_audioBufferPos++;
+    if(m_audioBufferPos == m_bufferSizeInSamples){
+        // swap buffers
+        std::swap(m_currentAudioBuffer, m_capturedAudioBuffer);
+        // reset the buffer position
+        m_audioBufferPos = 0;
+        setFilled(true);
+    }
+    return isFilled();
+}
+//---------------------------------------------------------------------------------------------------------------------
+void ADCBuffer::reset(){
+    // clear both buffers
+    memset(m_audioBuffer1, 0, m_bufferSizeInBytes);
+    memset(m_audioBuffer2, 0, m_bufferSizeInBytes);
+    setFilled(false);
+    m_audioBufferPos = 0;
+    m_currentAudioBuffer = m_audioBuffer1;
+    m_capturedAudioBuffer = m_audioBuffer2;
+}
 //---------------------------------------------------------------------------------------------------------------------
 AudioBuffer::AudioBuffer(){ ;
 }
@@ -125,12 +213,10 @@ uint32_t AudioBuffer::getWritePos(){
 uint32_t AudioBuffer::getReadPos(){
     return m_readPtr - m_buffer;
 }
-
-
 //---------------------------------------------------------------------------------------------------------------------
-Audio::Audio() {
-    //i2s configuration
-    m_i2s_num = I2S_NUM_0; // i2s port number
+Audio::Audio() : m_adc_buf(16384){
+    //i2s audio out configuration
+    m_i2s_num = I2S_NUM_1;              // i2s port number
     m_i2s_config.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
     m_i2s_config.sample_rate          = 16000;
     m_i2s_config.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
@@ -150,6 +236,25 @@ Audio::Audio() {
     m_DOUT=27;                       // Data Out
     setPinout(m_BCLK, m_LRC, m_DOUT, m_DIN);
 
+    // i2s audio in configuration for using the internal ADC
+    m_i2s_adc_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN),
+        .sample_rate = (int)m_adc_sampleRate,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_ALL_LEFT,
+        .communication_format = I2S_COMM_FORMAT_I2S_LSB,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 2,
+        .dma_buf_len = 1024,
+        .use_apll = APLL_ENABLE,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = I2S_PIN_NO_CHANGE
+    };
+
+    // setup channel
+    i2s_driver_install((i2s_port_t)I2S_NUM_0, &m_i2s_adc_config, 2, &m_i2sQueue);
+
+    // buffer init
     size_t size = InBuff.init();
     if(size == m_buffSizeRAM   - m_resBuffSize){
         sprintf(chbuf, "PSRAM not found, inputBufferSize = %u bytes", size -1);
@@ -180,8 +285,19 @@ Audio::~Audio() {
 //---------------------------------------------------------------------------------------------------------------------
 void Audio::reset(){
     stopSong();
-    I2Sstop(0);
-    I2Sstart(0);
+    // reset I2S1 (play)
+    I2Sstop(I2S_NUM_1);
+    I2Sstart(I2S_NUM_1);
+    // reset I2S0 (capture)
+    while (isADCTaskRunning())
+    {
+        Serial.println("Waiting for i2sReaderTask to finish...");
+        delay(10);
+    }
+    i2s_adc_disable(I2S_NUM_0);
+    I2Sstop(I2S_NUM_0);
+    I2Sstart(I2S_NUM_0);
+    // file/stream
     InBuff.resetBuffer();
     MP3Decoder_FreeBuffers();
     AACDecoder_FreeBuffers();
@@ -195,7 +311,8 @@ void Audio::reset(){
     m_f_ctseen=false;                                       // Contents type not seen yet
     m_f_firstmetabyte=false;
     m_f_firststream_ready=false;
-    m_f_localfile=false;                                    // SPIFFS or SD? (onnecttoFS)
+    m_f_localfile=false;                                    // SPIFFS or SD? (connecttoFS)
+    m_f_adc_running=false;                                          // ADC
     m_f_playing=false;
     m_f_ssl=false;
     m_f_stream=false;
@@ -629,6 +746,26 @@ bool Audio::connecttospeech(String speech, String lang){
     return true;
 }
 //---------------------------------------------------------------------------------------------------------------------
+bool Audio::connecttoADC(adc_unit_t adcUnit, adc1_channel_t adcChannel){
+    reset(); // free buffers an ser defaults
+    // set output sample rate to adc reader sample rate
+    setSampleRate(m_adc_sampleRate);
+    //init ADC pad
+    i2s_set_adc_mode(adcUnit, adcChannel);
+    // enable the adc
+    i2s_adc_enable(I2S_NUM_0);
+    // reset adc buffers
+    m_adc_buf.reset();
+    // init i2s adc task
+    m_f_adc_running = true;
+    TaskHandle_t taskHandle;
+    xTaskCreatePinnedToCore(Audio::i2sReaderTask, "i2s Reader Task", 4096, this, 1, &taskHandle, 0);
+    // start audio out
+    m_f_running = true;
+
+    return true;
+}
+//---------------------------------------------------------------------------------------------------------------------
 long long int Audio::XL (long long int a, const char* b) {
     int len = strlen(b);
     for (int c = 0; c < len - 2; c += 3) {
@@ -900,6 +1037,9 @@ void Audio::stopSong(){
         audiofile.close();
     }
     memset(m_outBuff, 0, sizeof(m_outBuff));     //Clear OutputBuffer
+    // stop adc
+    m_f_adc_running = false;
+
     i2s_zero_dma_buffer((i2s_port_t)m_i2s_num);
 }
 //---------------------------------------------------------------------------------------------------------------------
@@ -928,7 +1068,7 @@ bool Audio::playI2Sremains(){ // returns true if all dma_buffs flushed
 bool Audio::pauseResume()
 {
     bool retVal = false;
-    if(m_f_localfile || m_f_webstream)
+    if(m_f_localfile || m_f_webstream || m_f_adc_running)
     {
         m_f_running = !m_f_running;
         retVal = true;
@@ -1008,6 +1148,11 @@ void Audio::loop()
     if(m_f_webstream)
     {                                      // Playing file from URL?
         processWebStream();
+    }
+    // - ADC - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    if(m_f_adc_running)
+    {                                      // Playing file from URL?
+        processADC();
     }
 }
 //---------------------------------------------------------------------------------------------------------------------
@@ -1266,6 +1411,20 @@ void Audio::processWebStream() {
                 }
             }
         }
+    }
+}
+//---------------------------------------------------------------------------------------------------------------------
+void Audio::processADC(){
+    // wait for some samples to save
+    if(m_f_running && m_adc_buf.isFilled()){
+        size_t m_i2s_bytesWritten;
+        i2s_write((i2s_port_t)I2S_NUM_1,
+                (uint16_t*)m_adc_buf.getCapturedAudioBuffer(),
+                m_adc_buf.getBufferSizeInBytes(),
+                &m_i2s_bytesWritten,
+                portMAX_DELAY);
+        // Serial.printf("%d bytes written\n", m_i2s_bytesWritten);
+        m_adc_buf.setFilled(false);
     }
 }
 //---------------------------------------------------------------------------------------------------------------------
@@ -2136,5 +2295,35 @@ uint32_t Audio::inBufferFilled(){
 uint32_t Audio::inBufferFree(){
     return InBuff.freeSpace();
 }
-
-
+//---------------------------------------------------------------------------------------------------------------------
+QueueHandle_t Audio::getQueueHandle(){
+    return m_i2sQueue;
+}
+//---------------------------------------------------------------------------------------------------------------------
+bool Audio::isADCRunning(){
+    return m_f_adc_running;
+}
+//---------------------------------------------------------------------------------------------------------------------
+bool Audio::isADCTaskRunning(){
+    return m_adctask_running;
+}
+//---------------------------------------------------------------------------------------------------------------------
+void Audio::setADCTaskRunning(bool running){
+    m_adctask_running = running;
+}
+//---------------------------------------------------------------------------------------------------------------------
+void Audio::processI2SData(uint8_t *i2sData, size_t bytesRead)
+{
+    uint16_t *rawSamples = (uint16_t *)i2sData;
+    // int16_t mininmum = 0, maximum = 0;
+    for (int i = 0; i < bytesRead / 2; i++)
+    {
+        // add the sample to the current audio buffer
+        // int16_t val = ((int16_t)rawSamples[i])*15;
+        int16_t val = (2048 - (rawSamples[i] & 0xfff)) * 15;
+        // mininmum = min(mininmum, val);
+        // maximum = max(maximum, val);
+        m_adc_buf.addSample(Gain(val));
+    }
+    // Serial.printf("Min: %d Max %d\n", mininmum, maximum);
+}
