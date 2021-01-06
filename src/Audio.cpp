@@ -214,7 +214,7 @@ uint32_t AudioBuffer::getReadPos(){
     return m_readPtr - m_buffer;
 }
 //---------------------------------------------------------------------------------------------------------------------
-Audio::Audio() : m_adc_buf(16384){
+Audio::Audio() : m_adc_buf(8192){
     //i2s audio out configuration
     m_i2s_num = I2S_NUM_1;              // i2s port number
     m_i2s_config.mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
@@ -759,7 +759,8 @@ bool Audio::connecttoADC(adc_unit_t adcUnit, adc1_channel_t adcChannel){
     // init i2s adc task
     m_f_adc_running = true;
     TaskHandle_t taskHandle;
-    xTaskCreatePinnedToCore(Audio::i2sReaderTask, "i2s Reader Task", 4096, this, 1, &taskHandle, 0);
+    // pin task to core1 because wifi kernel is running on core0
+    xTaskCreatePinnedToCore(Audio::i2sReaderTask, "i2s Reader Task", 4096, this, 5, &taskHandle, 1);
     // start audio out
     m_f_running = true;
 
